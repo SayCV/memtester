@@ -25,14 +25,21 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
 
 #include "types.h"
 #include "sizes.h"
 #include "tests.h"
+#include "io_map.h"
+#include "va_2_pa.h"
+#include "cache.h"
 
 #define EXIT_FAIL_NONSTARTER    0x01
 #define EXIT_FAIL_ADDRESSLINES  0x02
 #define EXIT_FAIL_OTHERTEST     0x04
+
+void sighandler(int);
+int exit_code = 0;
 
 struct test tests[] = {
     { "Random Value", test_random_value },
@@ -104,6 +111,41 @@ off_t physaddrbase = 0;
 void usage(char *me) {
     fprintf(stderr, "\n"
             "Usage: %s [-p physaddrbase [-d device] [-u]] <mem>[B|K|M|G] [loops]\n",
+            "Usage: %s [-p physaddrbase [-d device] [-u]] [-e exit_when_error]"
+            "[-t test_pattern] [-c chip name]<mem>[B|K|M|G] [loops]\n"
+            "-p  testing phys address\n"
+            "-e  if not 0, exit immediately when test fail\n"
+            "-f  fixed bit to a exact level, 1: high, 0: low, which bits are depend on level(-l) bits\n"
+            "-b  fix bits, 1: fix bit level, 0: do not fix level\n"
+            "       example: -f 0x1 -b 0x1000: fix cpu bit 12 to high\n"
+            "       -f 0x0 -b 0x1000: fix cpu bit 12 to low\n"
+            "       when doing bitflip, bitspread, walkbits1,\n"
+            "       walkbits0, blockseq, checkerboard and solidbits tests.\n"
+            "-t  testing pattern mask, if null or 0 enable all test pattern\n"
+            "       bit0: Random Value\n"
+            "       bit1: Compare XOR\n"
+            "       bit2: Compare SUB\n"
+            "       bit3: Compare MUL\n"
+            "       bit4: Compare DIV\n"
+            "       bit5: Compare OR\n"
+            "       bit6: Compare AND\n"
+            "       bit7: Sequential Increment\n"
+            "       bit8: Solid Bits\n"
+            "       bit9: Block Sequential\n"
+            "       bit10: Checkerboard\n"
+            "       bit11: Bit Spread\n"
+            "       bit12: Bit Flip\n"
+            "       bit13: Walking Ones\n"
+            "       bit14: Walking Zeroes\n"
+            "       bit15: 8-bit Writes\n"
+            "       bit16: 16-bit Writes\n"
+            "       example: -t 0x1000,enable Bit Flip only\n"
+            "-c  chip name include:\n"
+            "       rk3036, rk3126, rk3228, rk3229, rv1108, rk3368, rk3128,"
+            " rk3188, rk3288, rk3228h, rk3328, rk3326, px30, rk1808, rv1109,"
+            " rv1126, rk3308\n"
+            "-w  ddr bus width, include:\n"
+            "       bw_x8, bw_x16, bw_x32\n",
             me);
     exit(EXIT_FAIL_NONSTARTER);
 }
@@ -113,11 +155,15 @@ int main(int argc, char **argv) {
     size_t pagesize, wantraw, wantmb, wantbytes, wantbytes_orig, bufsize,
          halflen, count;
     char *memsuffix, *addrsuffix, *loopsuffix;
+    char *chip_name = NULL;
+    char *ddr_bw = NULL;
     ptrdiff_t pagesizemask;
     void volatile *buf, *aligned;
-    ulv *bufa, *bufb;
+    u32v *bufa, *bufb;
     int do_mlock = 1, done_mem = 0;
-    int exit_code = 0;
+    ul error_exit = 0;
+    ul test_pattern = 0;
+    ul stuck_addr = 1;
     int memfd, opt, memshift;
     size_t maxbytes = -1; /* addressable memory, in bytes */
     size_t maxmb = (maxbytes >> 20) + 1; /* addressable memory, in MB */
@@ -128,6 +174,7 @@ int main(int argc, char **argv) {
     char *env_testmask = 0;
     ul testmask = 0;
     int o_flags = O_RDWR | O_SYNC;
+    u32 fix_level = 0, fix_bit = 0;
 
     printf("memtester version " __version__ " (%d-bit)\n", UL_LEN);
     printf("Copyright (C) 2001-2024 Charles Cazabon.\n");
@@ -152,7 +199,7 @@ int main(int argc, char **argv) {
         printf("using testmask 0x%lx\n", testmask);
     }
 
-    while ((opt = getopt(argc, argv, "p:d:u")) != -1) {
+    while ((opt = getopt(argc, argv, "p:d:u:e:f:b:t:c:w:")) != -1) {
         switch (opt) {
             case 'p':
                 errno = 0;
@@ -198,6 +245,53 @@ int main(int argc, char **argv) {
             case 'u':
 	            o_flags &= ~O_SYNC;
 	            break;
+            case 'e':
+                errno = 0;
+                error_exit = strtoull(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr,
+                        "failed to parse exit_when_error arg;\n");
+                    usage(argv[0]); /* doesn't return */
+                }
+                break;
+            case 'f':
+                errno = 0;
+                fix_level = strtoull(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr,
+                        "failed to parse test_pattern arg;\n");
+                    usage(argv[0]); /* doesn't return */
+                }
+                break;
+            case 'b':
+                errno = 0;
+                fix_bit = strtoull(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr,
+                        "failed to parse test_pattern arg;\n");
+                    usage(argv[0]); /* doesn't return */
+                }
+                break;
+            case 't':
+                errno = 0;
+                test_pattern = strtoull(optarg, NULL, 0);
+                if (errno != 0) {
+                    fprintf(stderr,
+                        "failed to parse test_pattern arg;\n");
+                    usage(argv[0]); /* doesn't return */
+                }
+                /* must add random value first */
+                if (test_pattern & 0x7e)
+                    test_pattern |= 0x1;
+                if (test_pattern)
+                    stuck_addr = 0;
+                break;
+            case 'c':
+                chip_name = optarg;
+                break;
+            case 'w':
+                ddr_bw = optarg;
+                break;
             default: /* '?' */
                 usage(argv[0]); /* doesn't return */
         }
@@ -385,10 +479,16 @@ int main(int argc, char **argv) {
        Note there are no security implications here */
     /* srand(time(0)); */
 
+    if (!use_phys)
+        printf("testing from phyaddress:0x%lx\n", read_pagemap((ul)aligned));
+
+    data_cpu_2_io_init(chip_name, ddr_bw);
     halflen = bufsize / 2;
-    count = halflen / sizeof(ul);
-    bufa = (ulv *) aligned;
-    bufb = (ulv *) ((size_t) aligned + halflen);
+    count = halflen / sizeof(u32);
+    bufa = (u32v *) aligned;
+    bufb = (u32v *) ((size_t) aligned + halflen);
+
+    signal(SIGINT, sighandler);
 
     for(loop=1; ((!loops) || loop <= loops); loop++) {
         printf("Loop %lu", loop);
@@ -396,12 +496,19 @@ int main(int argc, char **argv) {
             printf("/%lu", loops);
         }
         printf(":\n");
-        printf("  %-20s: ", "Stuck Address");
-        fflush(stdout);
-        if (!test_stuck_address(aligned, bufsize / sizeof(ul))) {
-             printf("ok\n");
-        } else {
-            exit_code |= EXIT_FAIL_ADDRESSLINES;
+        if (stuck_addr != 0) {
+            printf("  %-20s: ", "Stuck Address");
+            fflush(stdout);
+            if (!test_stuck_address(aligned, bufsize / sizeof(u32))) {
+                printf("ok\n");
+            } else {
+                exit_code |= EXIT_FAIL_ADDRESSLINES;
+                if (error_exit) {
+                    printf("EXIT_FAIL_ADDRESSLINES\n");
+                    fflush(stdout);
+                    exit(exit_code);
+                }
+            }
         }
         for (i=0;;i++) {
             if (!tests[i].name) break;
@@ -411,11 +518,17 @@ int main(int argc, char **argv) {
             if (testmask && (!((1 << i) & testmask))) {
                 continue;
             }
+            if (test_pattern && (!((1 << i) & test_pattern)))
+					continue;
             printf("  %-20s: ", tests[i].name);
-            if (!tests[i].fp(bufa, bufb, count)) {
+            if (!tests[i].fp(bufa, bufb, count, fix_bit, fix_level)) {
                 printf("ok\n");
             } else {
                 exit_code |= EXIT_FAIL_OTHERTEST;
+                if (error_exit) {
+                    printf("EXIT_FAIL_OTHERTEST\n");
+                    goto out;
+                }
             }
             fflush(stdout);
             /* clear buffer */
@@ -425,7 +538,14 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
     if (do_mlock) munlock((void *) aligned, bufsize);
-    printf("Done.\n");
+out:
     fflush(stdout);
-    exit(exit_code);
+    exit_result(exit_code);
 }
+
+void sighandler(int signum)
+{
+    fflush(stdout);
+    exit_result(exit_code);
+}
+
