@@ -25,6 +25,6 @@ typedef unsigned short volatile u16v;
 
 struct test {
     char *name;
-    int (*fp)(ulv *, ulv*, size_t);
+    int (*fp)();
 };
 

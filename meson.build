@@ -26,6 +26,7 @@ add_project_arguments('-DHAVE_CONFIG_H', language: 'c')
 add_project_arguments('-DHAVE_CONFIG_H', language: 'cpp')
 
 common_warning_flags = ['-DPOSIX', '-D_POSIX_C_SOURCE=200809L', '-D_FILE_OFFSET_BITS=64', '-DTEST_NARROW_WRITES']
+common_warning_flags += cc.get_supported_arguments('-Wno-implicit-function-declaration')
 
 # 配置选项
 conf = configuration_data()
